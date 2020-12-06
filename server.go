@@ -3,24 +3,29 @@ package myrpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"myrpc/codec"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
 
 type Option struct {
-	MagicNumber int
-	CodecType   codec.Type
+	MagicNumber    int
+	CodecType      codec.Type
+	ConnectTimeout time.Duration
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType: codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 
@@ -61,10 +66,10 @@ func (server *Server) ServeConn(conn net.Conn) {
 		log.Println("rpc server: invalid codec type:", option.CodecType)
 		return
 	}
-	server.ServeCodec(codecFunc(conn))
+	server.ServeCodec(codecFunc(conn), &option)
 }
 
-func (server *Server) ServeCodec(c codec.Codec) {
+func (server *Server) ServeCodec(c codec.Codec, opt *Option) {
 	sendingMutex := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 
@@ -79,7 +84,7 @@ func (server *Server) ServeCodec(c codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		server.handleRequest(c, req, sendingMutex, wg)
+		server.handleRequest(c, req, sendingMutex, wg, opt.HandleTimeout)
 	}
 }
 
@@ -174,19 +179,54 @@ func (server *Server) sendResponse(c codec.Codec, h *codec.Header, body interfac
 	}
 }
 
-func (server *Server) handleRequest(c codec.Codec, req *request, sendingMutex *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO, should call registered rpc methods to get the right replyv
-	// day 1, just print argv and send a hello message
+func (server *Server) handleRequest(c codec.Codec, req *request, sendingMutex *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.svc.call(req.mType, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendResponse(c, req.h, invalidRequest, sendingMutex)
+	// 存在两个可能超时的地方: 调用映射的服务方法处理报文超时, 发送响应报文超时
+	call := make(chan struct{})
+	send := make(chan struct{})
+
+	go func() {
+		err := req.svc.call(req.mType, req.argv, req.replyv)
+		call <- struct{}{}
+
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendResponse(c, req.h, invalidRequest, sendingMutex)
+			send <- struct{}{}
+			return
+		}
+		server.sendResponse(c, req.h, req.replyv.Interface(), sendingMutex)
+		send <- struct{}{}
+	}()
+
+	if timeout == 0 {
+		<- call
+		<- send
+		return
 	}
-	server.sendResponse(c, req.h, req.replyv.Interface(), sendingMutex)
+	select {
+	case <-time.After(timeout):
+		// TODO 是否有 goroutine 泄露的风险?
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(c, req.h, invalidRequest, sendingMutex)
+		return
+	case <-call:
+		<-send
+	}
 }
 
-
+func sendToChannel(c chan struct{}, msg struct{}, shutdown ...chan struct{}) {
+	if len(shutdown) == 1  {
+		closer := shutdown[0]
+		select {
+		case <-closer:
+			return
+		case c <- msg:
+		}
+	} else {
+		c <- msg
+	}
+}
 
 func Accept(listener net.Listener) {
 	DefaultServer.Accept(listener)
