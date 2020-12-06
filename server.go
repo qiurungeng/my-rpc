@@ -2,11 +2,12 @@ package myrpc
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
 	"myrpc/codec"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -23,7 +24,9 @@ var DefaultOption = &Option{
 }
 
 
-type Server struct{}
+type Server struct{
+	serviceMap sync.Map
+}
 
 func NewServer() *Server {
 	return &Server{}
@@ -80,10 +83,47 @@ func (server *Server) ServeCodec(c codec.Codec) {
 	}
 }
 
+// Register: 服务注册
+func (server *Server) Register(receiver interface{}) error {
+	s := newService(receiver)
+	if _, loaded := server.serviceMap.LoadOrStore(s.name, s); loaded {
+		return errors.New("rpc: service already defined:" + s.name)
+	}
+	return nil
+}
+
+// DefaultServer.Register
+func Register(receiver interface{}) error {
+	return DefaultServer.Register(receiver)
+}
+
+func (server *Server) findService(serviceMethod string) (svc *service, mType *methodType, err error) {
+	docIdx := strings.LastIndex(serviceMethod, ".")
+	if docIdx < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	serviceName := serviceMethod[:docIdx]
+	methodName := serviceMethod[docIdx + 1:]
+	s, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service:" + serviceName)
+		return
+	}
+	svc = s.(*service)
+	mType = svc.methods[methodName]
+	if mType == nil {
+		err = errors.New("rpc server: can't find method:" + methodName)
+	}
+	return
+}
+
 
 type request struct {
 	h            *codec.Header
 	argv, replyv reflect.Value
+	mType        *methodType
+	svc          *service
 }
 
 var invalidRequest = struct{}{} // a placeholder for response argv when error occurs
@@ -104,9 +144,23 @@ func (server *Server) readRequest(c codec.Codec) (*request, error) {
 	}
 
 	req := &request{h: header}
-	req.argv = reflect.New(reflect.TypeOf(""))	// 暂时假设参数类型都为 string
-	if err := c.ReadBody(req.argv.Interface()); err != nil {
+	req.svc, req.mType, err = server.findService(header.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	// 通过 newArgv() 和 newReplyv() 两个方法创建出两个入参实例
+	req.argv = req.mType.newArgv()
+	req.replyv = req.mType.newReplyv()
+
+	// 确保 argvi 为 pointer
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	// 将请求报文反序列化为第一个入参 argv
+	if err := c.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read argv err:", err)
+		return req, err
 	}
 
 	return req, nil
@@ -120,13 +174,16 @@ func (server *Server) sendResponse(c codec.Codec, h *codec.Header, body interfac
 	}
 }
 
-func (server *Server) handleRequest(c codec.Codec, req *request, mutex *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(c codec.Codec, req *request, sendingMutex *sync.Mutex, wg *sync.WaitGroup) {
 	// TODO, should call registered rpc methods to get the right replyv
 	// day 1, just print argv and send a hello message
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("myrpc resp %d", req.h.Seq))
-	server.sendResponse(c, req.h, req.replyv.Interface(), mutex)
+	err := req.svc.call(req.mType, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(c, req.h, invalidRequest, sendingMutex)
+	}
+	server.sendResponse(c, req.h, req.replyv.Interface(), sendingMutex)
 }
 
 
