@@ -1,6 +1,7 @@
 package myrpc
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"log"
 	"myrpc/codec"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -155,6 +158,27 @@ func Dial(network, address string, opts ...*Option) (client *Client, err error) 
 	return dialTimeout(NewClient, network, address, opts...)
 }
 
+func DialHTTP(network, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// XDial 由 rpcAddr 确定以何种协议连接到 RPC server
+// rpcAddr 是代表 rpc 服务地址及连接方式的格式化字符 (protocol@addr)
+// eg, http@10.0.0.1:7001, tcp@10.0.0.1:9999, unix@/tmp/myrpc.sock
+func XDial(rpcAddr string, opt ...*Option) (*Client, error) {
+	split := strings.Split(rpcAddr, "@")
+	if len(split) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect 'protocol@addr'", rpcAddr)
+	}
+	protocol, addr := split[0], split[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opt...)
+	default:
+		return Dial(protocol, addr, opt...)
+	}
+}
+
 func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
 	option, err := parseOption(opts...)
 	if err != nil {
@@ -197,6 +221,23 @@ type dialResult struct {
 }
 
 type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+// NewHTTPClient: 通过HTTP传输协议新建一个 Client
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+
+	// Require successful HTTP response
+	// before switching to RPC protocol.
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+		log.Println(err)
+	}
+	return nil, err
+}
 
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	f := codec.NewCodecFuncMap[opt.CodecType]
