@@ -34,14 +34,14 @@ type MultiServersDiscovery struct {
 }
 
 func NewMultiServerDiscovery(servers []string) *MultiServersDiscovery {
-	d := &MultiServersDiscovery{
+	m := &MultiServersDiscovery{
 		servers: servers,
 		// 初始化时使用时间戳设定随机数种子，避免每次产生相同的随机数序列
 		r: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	// 为了避免每次从 0 开始，初始化时随机设定一个值
-	d.index = d.r.Intn(math.MaxInt32 - 1)
-	return d
+	m.index = m.r.Intn(math.MaxInt32 - 1)
+	return m
 }
 
 func (m *MultiServersDiscovery) Refresh() error {
